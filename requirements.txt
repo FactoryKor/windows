@@ -1,9 +1,0 @@
-# windows_diagnose.py — Windows OS diagnostic (read-only)
-# Log Analytics KQL 질의 + Entra 인증 + (선택) VM 제어 평면 조회
-
-azure-identity>=1.15
-azure-monitor-query>=1.2
-azure-mgmt-compute>=30.0
-
-# 선택: HTML 리포트를 Blob 정적 웹사이트에 게시(REPORT_STORAGE_ACCOUNT 설정 시만 동작)
-report-publish @ git+https://github.com/FactoryKor/report-publish.git@v1.0.0
