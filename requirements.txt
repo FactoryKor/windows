@@ -1,0 +1,12 @@
+# windows_diagnose.py — Windows OS diagnostic (read-only)
+# azure-monitor 모드: Log Analytics KQL 질의 + Entra 인증 + (선택) VM 제어 평면 조회
+# direct 모드: WinRM으로 온프레미스/AWS/GCP 등 어디서나 직접 수집(Azure Monitor 불필요)
+
+azure-identity>=1.15
+azure-monitor-query>=1.2
+azure-mgmt-compute>=30.0
+azure-mgmt-hybridcompute>=9.0
+pywinrm>=0.4
+
+# 선택: HTML 리포트를 Blob 정적 웹사이트에 게시(REPORT_STORAGE_ACCOUNT 설정 시만 동작)
+report-publish @ git+https://github.com/FactoryKor/report-publish.git@v1.0.0
