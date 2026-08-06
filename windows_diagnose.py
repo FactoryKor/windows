@@ -52,7 +52,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 TOOL_NAME = "windows_diagnose"
@@ -67,10 +67,63 @@ DEFAULTS = {
     "disk_free_warn": 15.0, "disk_free_crit": 5.0,   # % Free Space (lower = worse)
     "heartbeat_warn_min": 15, "heartbeat_crit_min": 60,
     "log_err_warn": 10, "log_err_crit": 50,          # Error/Critical events over window
+    "services_warn": 1, "services_crit": 5,          # stopped Automatic-start services
+    "eol_warn_days": 180,                            # OS EOL이 이 일수 이내면 warning
 }
 
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2, "ok": 3}
 SEV_LABEL_KO = {"critical": "위험", "warning": "주의", "info": "정보", "ok": "양호"}
+
+# --------------------------------------------------------------------------- #
+# OS 수명주기 표(참고용, 주기적 갱신 필요) — windows_upgrade_diagnose에서 통합됨. 순서 중요(구체적인 패턴 먼저 매칭)
+# --------------------------------------------------------------------------- #
+OS_LIFECYCLE: list[dict[str, Any]] = [
+    {"match": "Windows Server 2012 R2", "name": "Windows Server 2012 R2",
+     "eol": date(2023, 10, 10), "esm_eol": date(2026, 10, 13)},
+    {"match": "Windows Server 2012", "name": "Windows Server 2012",
+     "eol": date(2023, 10, 10), "esm_eol": None},
+    {"match": "Windows Server 2016", "name": "Windows Server 2016",
+     "eol": date(2027, 1, 12), "esm_eol": None},
+    {"match": "Windows Server 2019", "name": "Windows Server 2019",
+     "eol": date(2029, 1, 9), "esm_eol": None},
+    {"match": "Windows Server 2022", "name": "Windows Server 2022",
+     "eol": date(2031, 10, 14), "esm_eol": None},
+    {"match": "Windows Server 2025", "name": "Windows Server 2025",
+     "eol": date(2034, 10, 10), "esm_eol": None},
+    {"match": "Windows 11", "name": "Windows 11 (에디션/빌드별 별도 확인 필요)",
+     "eol": date(2027, 10, 12), "esm_eol": None},
+    {"match": "Windows 10", "name": "Windows 10",
+     "eol": date(2025, 10, 14), "esm_eol": date(2028, 10, 10)},
+]
+
+KNOWN_EOL_SOFTWARE: list[dict[str, str]] = [
+    {"pattern": r"microsoft \.net framework 4\.[0-5]([^0-9]|$)", "name": ".NET Framework 4.0~4.5.2",
+     "eol": "2022-04-26", "note": ".NET Framework 4.8 이상 또는 .NET(Core) 최신 LTS로 마이그레이션하세요."},
+    {"pattern": r"sql server 2012", "name": "SQL Server 2012", "eol": "2022-07-12",
+     "note": "SQL Server 2019/2022로 업그레이드하세요(mssql_diagnose로 세부 진단 가능)."},
+    {"pattern": r"sql server 2014", "name": "SQL Server 2014", "eol": "2024-07-09",
+     "note": "SQL Server 2019/2022로 업그레이드하세요(mssql_diagnose로 세부 진단 가능)."},
+    {"pattern": r"^java (7|6|se 6|se 7)\b|jre 7|jre 6", "name": "Java 6/7(Oracle)", "eol": "2022-07-01",
+     "note": "Java 11/17/21 LTS로 업그레이드하세요."},
+    {"pattern": r"python 2\.", "name": "Python 2.x", "eol": "2020-01-01",
+     "note": "Python 3.x로 마이그레이션하세요."},
+    {"pattern": r"internet explorer", "name": "Internet Explorer", "eol": "2022-06-15",
+     "note": "Microsoft Edge(IE 모드 포함)로 전환하세요."},
+    {"pattern": r"visual c\+\+ 2008|visual c\+\+ 2010", "name": "구버전 Visual C++ Redistributable",
+     "eol": "-", "note": "최신 Visual C++ Redistributable로 교체를 검토하세요."},
+]
+
+RECOMMENDED_SOFTWARE: list[dict[str, str]] = [
+    {"check": "Azure Connected Machine 에이전트(Azure Arc)", "pattern": r"azure connected machine agent",
+     "reason": "Azure Arc로 온보딩하면 patch/정책/모니터링을 중앙에서 통합 관리할 수 있습니다"
+              "(azure-monitor 모드의 전제 조건이기도 합니다)."},
+    {"check": "Microsoft Defender(또는 동급 엔드포인트 보호)", "pattern": r"defender|endpoint protection",
+     "reason": "엔드포인트 보호가 없으면 멀웨어/랜섬웨어에 취약합니다."},
+    {"check": "PowerShell 7 이상", "pattern": r"powershell 7",
+     "reason": "최신 PowerShell은 성능/보안 패치가 지속 제공됩니다(Windows PowerShell 5.1은 유지보수 모드)."},
+    {"check": "백업 에이전트(Azure Backup/MARS 등)", "pattern": r"microsoft azure recovery|azure backup|mars agent",
+     "reason": "정기 백업 없이는 장애/랜섬웨어 발생 시 복구가 불가능합니다."},
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -385,7 +438,7 @@ def parse_cpu_load(text: str) -> Optional[dict]:
         pct = float(text.strip().splitlines()[-1])
     except (ValueError, IndexError):
         return None
-    return {"avg": pct, "max": pct}
+    return {"avg_val": pct, "max_val": pct}
 
 
 def parse_os_memory(text: str) -> Optional[dict]:
@@ -400,7 +453,7 @@ def parse_os_memory(text: str) -> Optional[dict]:
     if total_kb <= 0:
         return None
     used_pct = (1.0 - free_kb / total_kb) * 100.0
-    return {"avg": used_pct, "max": used_pct}
+    return {"avg_val": used_pct, "max_val": used_pct}
 
 
 def parse_logical_disks(text: str) -> list[dict]:
@@ -460,17 +513,34 @@ def parse_update_count(text: str) -> list[dict]:
     return [{"Classification": "Security Updates", "count_": n}]
 
 
-def collect_cpu_direct(session) -> Optional[dict]:
+def parse_services(text: str) -> list[dict]:
+    rows: list[dict] = []
+    for line in text.strip().splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        name, display, state = parts
+        rows.append({"Name": name, "DisplayName": display or name, "State": state})
+    return rows
+
+
+def parse_roles_features(text: str) -> list[dict]:
+    return [{"Name": line.strip()} for line in text.strip().splitlines() if line.strip()]
+
+
+def collect_cpu_direct(session) -> list[dict]:
     out, _err, code = _winrm_run(session,
         "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average")
-    return parse_cpu_load(out) if code == 0 else None
+    row = parse_cpu_load(out) if code == 0 else None
+    return [row] if row else []
 
 
-def collect_memory_direct(session) -> Optional[dict]:
+def collect_memory_direct(session) -> list[dict]:
     out, _err, code = _winrm_run(session,
         "$os = Get-CimInstance Win32_OperatingSystem; "
         "'{0}|{1}' -f $os.TotalVisibleMemorySize,$os.FreePhysicalMemory")
-    return parse_os_memory(out) if code == 0 else None
+    row = parse_os_memory(out) if code == 0 else None
+    return [row] if row else []
 
 
 def collect_disk_direct(session) -> list[dict]:
@@ -508,6 +578,58 @@ def collect_update_direct(session) -> list[dict]:
         "@($r.Updates | Where-Object { $_.MsrcSeverity }).Count "
         "} catch { '-1' }")
     return parse_update_count(out)
+
+
+def collect_services_direct(session) -> list[dict]:
+    # 자동 시작(Automatic)으로 설정됐지만 현재 중지된 서비스만 조회한다(문제 후보만 추려서 경량화).
+    out, _err, code = _winrm_run(session,
+        "Get-CimInstance Win32_Service -Filter \"StartMode='Auto' and State!='Running'\" | "
+        "ForEach-Object { '{0}|{1}|{2}' -f $_.Name,$_.DisplayName,$_.State }")
+    return parse_services(out) if code == 0 else []
+
+
+def collect_roles_features_direct(session) -> list[dict]:
+    # Get-WindowsFeature은 Windows Server 전용(ServerManager 모듈) — 클라이언트 OS이거나
+    # 모듈이 없으면 조용히 빈 목록으로 폴백한다(참고용 정보라 실패해도 진단은 계속된다).
+    out, _err, code = _winrm_run(session,
+        "try { Import-Module ServerManager -ErrorAction Stop; "
+        "(Get-WindowsFeature | Where-Object { $_.Installed }).Name } catch { '' }")
+    return parse_roles_features(out) if code == 0 else []
+
+
+def collect_os_info_direct(session) -> dict[str, str]:
+    out, _err, code = _winrm_run(session,
+        "$os = Get-CimInstance Win32_OperatingSystem; "
+        "'{0}|{1}|{2}' -f $os.Caption,$os.Version,$os.BuildNumber")
+    if code != 0 or not out.strip():
+        return {}
+    parts = out.strip().splitlines()[-1].split("|")
+    if len(parts) != 3:
+        return {}
+    return {"caption": parts[0], "version": parts[1], "build": parts[2]}
+
+
+def collect_tpm_secureboot_direct(session) -> dict[str, str]:
+    out, _err, _code = _winrm_run(session,
+        "$tpmVer = 'unknown'; $sb = 'unknown'; "
+        "try { $tpmVer = (Get-Tpm).ManufacturerVersion } catch {}; "
+        "try { $sb = if (Confirm-SecureBootUEFI) {'Enabled'} else {'Disabled'} } catch { $sb = 'Unsupported' }; "
+        "'{0}|{1}' -f $tpmVer,$sb")
+    parts = (out.strip().splitlines() or ["unknown|unknown"])[-1].split("|")
+    if len(parts) != 2:
+        return {"tpm": "unknown", "secure_boot": "unknown"}
+    return {"tpm": parts[0], "secure_boot": parts[1]}
+
+
+def collect_installed_software_direct(session) -> list[str]:
+    out, _err, code = _winrm_run(session,
+        "$paths = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', "
+        "'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; "
+        "Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.DisplayName } | ForEach-Object { $_.DisplayName }")
+    if code != 0:
+        return []
+    return [l.strip() for l in out.splitlines() if l.strip()]
 
 
 # --------------------------------------------------------------------------- #
@@ -674,6 +796,167 @@ def evaluate_update(report: Report, rows: list[dict]) -> None:
         report.add("patch", "ok", "패치 상태 양호", "대기 중인 보안 업데이트가 없습니다.")
 
 
+def evaluate_services(report: Report, rows: list[dict], thr: dict) -> None:
+    if report.collection_mode != "direct":
+        report.add("services", "info", "서비스 상태 미평가",
+                   "자동 시작(Automatic) 서비스의 중지 여부는 direct 모드(WinRM)에서만 진단합니다 "
+                   "(서비스 인벤토리는 기본 Azure Monitor 텔레메트리에 포함되지 않습니다).")
+        return
+    if not rows:
+        report.add("services", "ok", "서비스 상태 양호",
+                   "자동 시작으로 설정된 서비스 중 중지된 서비스가 없습니다.")
+        return
+    count = len(rows)
+    names = ", ".join(r.get("DisplayName") or r.get("Name") or "?" for r in rows[:10])
+    more = " 등" if count > 10 else ""
+    if count >= thr["services_crit"]:
+        report.add("services", "critical", "자동 시작 서비스 다수 중지",
+                   f"자동 시작으로 설정됐지만 중지된 서비스 {count}건: {names}{more} "
+                   f"(기준 critical ≥ {thr['services_crit']}건).",
+                   {"count": count, "services": [r["Name"] for r in rows]},
+                   recommendation="중지된 서비스가 의도된 것인지 확인하고, 아니라면 즉시 시작하거나 원인을 조사하세요.")
+    elif count >= thr["services_warn"]:
+        report.add("services", "warning", "자동 시작 서비스 중지됨",
+                   f"자동 시작으로 설정됐지만 중지된 서비스 {count}건: {names}{more} "
+                   f"(기준 warning ≥ {thr['services_warn']}건).",
+                   {"count": count, "services": [r["Name"] for r in rows]},
+                   recommendation="해당 서비스가 의도적으로 중지된 것인지 확인하세요.")
+
+
+def evaluate_roles_features(report: Report, rows: list[dict]) -> None:
+    if report.collection_mode != "direct":
+        report.add("roles_features", "info", "설치된 역할/기능 미평가",
+                   "Windows Server 역할/기능 목록은 direct 모드(WinRM)에서만 조회합니다.")
+        return
+    if not rows:
+        report.add("roles_features", "info", "설치된 역할/기능 확인 불가",
+                   "Get-WindowsFeature 결과가 없습니다(클라이언트 OS이거나 ServerManager 모듈이 "
+                   "없는 환경일 수 있습니다 — 참고용 정보이며 문제로 간주하지 않습니다).")
+        return
+    names = ", ".join(r["Name"] for r in rows[:15])
+    more = " 등" if len(rows) > 15 else ""
+    report.add("roles_features", "info", f"설치된 역할/기능 {len(rows)}개",
+              f"{names}{more}",
+              {"count": len(rows), "features": [r["Name"] for r in rows]})
+
+
+def evaluate_os_lifecycle(report: Report, os_info: dict[str, str], thr: dict) -> None:
+    if report.collection_mode != "direct":
+        report.add("os_lifecycle", "info", "OS 수명주기 미평가",
+                   "OS EOL 수명주기는 direct 모드(WinRM)에서만 진단합니다 — --skip-upgrade-check로 "
+                   "꺼져 있거나 azure-monitor 모드이면 표시됩니다.")
+        return
+    caption = os_info.get("caption") or ""
+    if not caption:
+        report.add("os_lifecycle", "info", "OS 정보 확인 불가",
+                  "Win32_OperatingSystem 조회에 실패해 OS 버전을 확인하지 못했습니다.")
+        return
+
+    entry = next((e for e in OS_LIFECYCLE if e["match"].lower() in caption.lower()), None)
+    if not entry:
+        report.add("os_lifecycle", "info", f"수명주기 정보 없음: {caption}",
+                  "임베디드 수명주기 표에 없는 OS입니다. 공식 Microsoft Lifecycle 페이지에서 "
+                  "직접 확인하세요.", {"caption": caption})
+        return
+
+    today = date.today()
+    eol = entry["eol"]
+    days_left = (eol - today).days
+    name = entry["name"]
+    esm_eol = entry.get("esm_eol")
+
+    if days_left < 0:
+        detail = f"{name}은(는) {eol.isoformat()}에 지원이 종료되었습니다({-days_left}일 경과)."
+        if esm_eol and today <= esm_eol:
+            detail += f" 확장 보안 업데이트(ESU)가 {esm_eol.isoformat()}까지 가능할 수 있습니다."
+        report.add("os_lifecycle", "critical", f"OS 지원 종료: {name}", detail,
+                  {"eol": eol.isoformat(), "days_since_eol": -days_left, "caption": caption},
+                  recommendation="최신 지원 버전으로 업그레이드하거나(사내 정책에 따라 신규 서버로 "
+                                 "교체), 불가피하면 ESU(확장 보안 업데이트)를 신청하세요.")
+    elif days_left <= thr["eol_warn_days"]:
+        report.add("os_lifecycle", "warning", f"OS 지원 종료 임박: {name}",
+                  f"{eol.isoformat()}에 지원이 종료됩니다({days_left}일 남음).",
+                  {"eol": eol.isoformat(), "days_left": days_left, "caption": caption},
+                  recommendation="업그레이드 일정을 계획하세요.")
+    else:
+        report.add("os_lifecycle", "ok", f"OS 지원 기간 양호: {name}",
+                  f"지원 종료까지 {days_left}일 남음({eol.isoformat()}).")
+
+    report.add("os_version", "info", "OS 버전", f"{caption} (빌드 {os_info.get('build', '?')}, 참고용).")
+
+
+def evaluate_win11_readiness(report: Report, os_info: dict[str, str], tpm_sb: dict[str, str]) -> None:
+    if report.collection_mode != "direct":
+        return
+    caption = (os_info.get("caption") or "").lower()
+    if "windows 10" not in caption:
+        return  # Windows 10이 아니면 이 점검은 해당 없음
+    tpm = tpm_sb.get("tpm", "unknown")
+    sb = tpm_sb.get("secure_boot", "unknown")
+    tpm_ok = tpm not in ("unknown", "") and not tpm.startswith("1.2")
+    if sb == "Enabled" and tpm_ok:
+        report.add("win11_readiness", "ok", "Windows 11 하드웨어 요건 충족(참고)",
+                  f"TPM {tpm}, Secure Boot {sb}. (CPU 세대 등 다른 요건은 별도 확인 필요)")
+    else:
+        report.add("win11_readiness", "warning", "Windows 11 하드웨어 요건 미충족 가능성",
+                  f"TPM {tpm}, Secure Boot {sb}. TPM 2.0과 Secure Boot 활성화가 필요합니다.",
+                  {"tpm": tpm, "secure_boot": sb},
+                  recommendation="TPM 2.0 활성화(BIOS/UEFI) 및 Secure Boot 활성화 여부를 확인하세요. "
+                                 "CPU 세대 등 다른 요건은 PC Health Check 도구로 추가 확인하세요.")
+
+
+def evaluate_known_eol_software(report: Report, software: list[str]) -> None:
+    if report.collection_mode != "direct":
+        report.add("software_eol", "info", "설치 프로그램 EOL 미평가",
+                   "설치 프로그램 목록은 direct 모드(WinRM)에서만 조회합니다.")
+        return
+    if not software:
+        report.add("software_eol", "info", "설치 프로그램 목록 미평가",
+                  "레지스트리 Uninstall 키 조회에 실패해 설치 프로그램을 확인하지 못했습니다.")
+        return
+    hits = []
+    for rule in KNOWN_EOL_SOFTWARE:
+        pat = re.compile(rule["pattern"], re.IGNORECASE)
+        matched = [s for s in software if pat.search(s)]
+        if matched:
+            hits.append((rule, matched))
+    if not hits:
+        report.add("software_eol", "ok", "알려진 EOL 소프트웨어 없음",
+                  f"설치된 프로그램 {len(software)}개 중 알려진 EOL/구식 소프트웨어 패턴과 일치하는 "
+                  f"항목이 없습니다.")
+        return
+    for rule, matched in hits:
+        report.add("software_eol", "warning", f"EOL 소프트웨어 발견: {rule['name']}",
+                  f"설치된 항목: {', '.join(matched[:5])}"
+                  + ("…" if len(matched) > 5 else "") + f" (EOL: {rule['eol']}). {rule['note']}",
+                  {"software": matched, "eol": rule["eol"]},
+                  recommendation=rule["note"])
+
+
+def evaluate_recommended_software(report: Report, software: list[str]) -> None:
+    if report.collection_mode != "direct":
+        report.add("recommended_software", "info", "권장 소프트웨어 점검 미평가",
+                   "권장 소프트웨어 설치 여부는 direct 모드(WinRM)에서만 확인합니다.")
+        return
+    if not software:
+        report.add("recommended_software", "info", "권장 소프트웨어 점검 미평가",
+                  "설치 프로그램 목록을 가져오지 못해 권장 소프트웨어 설치 여부를 확인할 수 없습니다.")
+        return
+    missing = []
+    for item in RECOMMENDED_SOFTWARE:
+        pat = re.compile(item["pattern"], re.IGNORECASE)
+        if not any(pat.search(s) for s in software):
+            missing.append(item)
+    if not missing:
+        report.add("recommended_software", "ok", "권장 소프트웨어 모두 설치됨",
+                  "기본 관리 도구 세트(엔드포인트 보호/관리 에이전트/최신 PowerShell/백업 에이전트)가 "
+                  "모두 확인되었습니다.")
+        return
+    for item in missing:
+        report.add("recommended_software", "info", f"권장 소프트웨어 미설치: {item['check']}",
+                  item["reason"], recommendation=f"{item['check']} 설치를 검토하세요.")
+
+
 def evaluate_control_plane(report: Report) -> None:
     if not report.vm_info:
         return
@@ -731,6 +1014,12 @@ def evaluate(report: Report, data: dict, thr: dict) -> None:
     evaluate_logs(report, data.get("log_errors") or [], thr)
     evaluate_shutdown(report, data.get("shutdown"))
     evaluate_update(report, data.get("update") or [])
+    evaluate_services(report, data.get("services") or [], thr)
+    evaluate_roles_features(report, data.get("roles_features") or [])
+    evaluate_os_lifecycle(report, data.get("os_info") or {}, thr)
+    evaluate_win11_readiness(report, data.get("os_info") or {}, data.get("tpm_sb") or {})
+    evaluate_known_eol_software(report, data.get("software") or [])
+    evaluate_recommended_software(report, data.get("software") or [])
     evaluate_control_plane(report)
 
 
@@ -954,6 +1243,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     safety = p.add_argument_group("safety")
     safety.add_argument("--skip-patch-check", action="store_true", help=argparse.SUPPRESS)
+    safety.add_argument("--skip-upgrade-check", action="store_true",
+                        help="OS EOL 수명주기/설치 프로그램 전체 목록 조회를 생략합니다(대상 서버 부하 감소).")
 
     tn = p.add_argument_group("tunables")
     tn.add_argument("--hours", type=int, default=24)
@@ -967,6 +1258,10 @@ def build_parser() -> argparse.ArgumentParser:
     tn.add_argument("--heartbeat-crit-min", type=int, default=DEFAULTS["heartbeat_crit_min"])
     tn.add_argument("--log-err-warn", type=int, default=DEFAULTS["log_err_warn"])
     tn.add_argument("--log-err-crit", type=int, default=DEFAULTS["log_err_crit"])
+    tn.add_argument("--services-warn", type=int, default=DEFAULTS["services_warn"])
+    tn.add_argument("--services-crit", type=int, default=DEFAULTS["services_crit"])
+    tn.add_argument("--eol-warn-days", type=int, default=DEFAULTS["eol_warn_days"],
+                    help="OS EOL까지 이 일수 이내면 warning로 표시")
 
     out = p.add_argument_group("output")
     out.add_argument("--format", choices=["table", "json", "html"], default="table")
@@ -986,7 +1281,9 @@ def _thresholds(args) -> dict:
            "mem_warn": args.mem_warn, "mem_crit": args.mem_crit,
            "disk_free_warn": args.disk_free_warn, "disk_free_crit": args.disk_free_crit,
            "heartbeat_warn_min": args.heartbeat_warn_min, "heartbeat_crit_min": args.heartbeat_crit_min,
-           "log_err_warn": args.log_err_warn, "log_err_crit": args.log_err_crit}
+           "log_err_warn": args.log_err_warn, "log_err_crit": args.log_err_crit,
+           "services_warn": args.services_warn, "services_crit": args.services_crit,
+           "eol_warn_days": args.eol_warn_days}
 
 
 def _maybe_control_plane(report: Report, args, nag_if_missing: bool) -> None:
@@ -1109,12 +1406,21 @@ def build_report_direct(args, thr: dict) -> Report:
             ("memory", lambda: collect_memory_direct(session)),
             ("disk", lambda: collect_disk_direct(session)),
             ("log_errors", lambda: collect_event_errors_direct(session, args.hours)),
-            ("shutdown", lambda: collect_shutdown_direct(session, args.hours))]
+            ("shutdown", lambda: collect_shutdown_direct(session, args.hours)),
+            ("services", lambda: collect_services_direct(session)),
+            ("roles_features", lambda: collect_roles_features_direct(session))]
     if args.skip_patch_check:
         report.add("patch", "info", "패치 점검 생략",
                   "--skip-patch-check 지정으로 생략했습니다(Windows Update 검색 부하 방지).")
     else:
         steps.append(("update", lambda: collect_update_direct(session)))
+    if args.skip_upgrade_check:
+        report.add("os_lifecycle", "info", "업그레이드 준비도 점검 생략",
+                  "--skip-upgrade-check 지정으로 생략했습니다(설치 프로그램 전체 목록 조회 부하 방지).")
+    else:
+        steps.append(("os_info", lambda: collect_os_info_direct(session)))
+        steps.append(("tpm_sb", lambda: collect_tpm_secureboot_direct(session)))
+        steps.append(("software", lambda: collect_installed_software_direct(session)))
     for key, fn in steps:
         try:
             data[key] = fn()
