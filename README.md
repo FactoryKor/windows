@@ -48,6 +48,8 @@ python windows_diagnose.py --source direct --host WIN-ONPREM01 --winrm-user diag
 | 메모리 사용률 | 디스크 여유공간 |
 | 이벤트 로그 Error/Critical 건수 | 예기치 않은 종료/재시작 |
 | 보안 업데이트 누락 | VM/Arc 머신 연결·전원 상태, 크기, OS 버전(선택, ARM) |
+| 자동 시작 서비스 중 중지된 서비스(direct 전용) | 설치된 Windows Server 역할/기능 목록(direct 전용, 참고용) |
+| OS 수명주기(EOL) 및 설치 프로그램 EOL 탐지(direct 전용) | 권장 관리 도구(Azure Arc/Defender/PowerShell 7 등) 설치 여부(direct 전용) |
 
 ---
 
@@ -82,6 +84,8 @@ python windows_diagnose.py --source direct --host WIN-ONPREM01 --winrm-user diag
 | 4 | 이벤트 로그 | System/Application Error/Critical 건수 | `Get-WinEvent -FilterHashtable` (Level 1,2) |
 | 5 | 예기치 않은 종료 | Kernel-Power(41)/EventLog(6008) | `Get-WinEvent -FilterHashtable` (Id 41,6008) |
 | 6 | 패치 | 보안 업데이트 대기 건수(최선다) | Windows Update Agent COM(`Microsoft.Update.Session`, 별도 모듈 불필요) |
+| 7 | 서비스 | 자동 시작(Automatic)인데 중지된 서비스 | `Get-CimInstance Win32_Service -Filter "StartMode='Auto' and State!='Running'"` |
+| 8 | 역할/기능 | 설치된 Windows Server 역할/기능(참고용, Windows Server 전용) | `Get-WindowsFeature`(ServerManager 모듈, 클라이언트 OS에서는 자동 생략) |
 
 `--host`(미지정 시 `--computer` 값 사용)와 `--winrm-user`가 **필수**입니다. Azure Monitor/Log Analytics workspace가 전혀 없어도 동작합니다 — 이것이 온프레미스·AWS·GCP 서버 지원의 핵심입니다.
 
@@ -119,7 +123,22 @@ python windows_diagnose.py --source direct --host WIN-ONPREM01 --winrm-user diag
 
 ---
 
-## ⚙️ 설치
+## ⚙️ Prerequisites
+
+**MCP 서버 / Azure SRE Agent로 사용할 때**
+- 별도 설치가 필요 없습니다 — 이 도구가 MCP 서버 컨테이너에 pip 패키지로 이미 설치돼 있고, 필요한 자격 증명(관리 ID 또는 `WINDOWS_DIAGNOSE_WINRM_PASSWORD`)도 컨테이너에 구성돼 있습니다. SRE Agent에서 `diagnose_windows_os` 도구를 호출하기만 하면 됩니다.
+
+**단독 실행(Standalone)할 때**
+- Python 3.10+
+- direct 모드(WinRM)를 쓰려면 대상 Windows 서버에서 WinRM이 활성화돼 있어야 합니다(`Enable-PSRemoting -Force`). azure-monitor 모드는 `az login`(로컬) 또는 관리 ID가 필요합니다.
+
+---
+
+## ⚙️ Installation & Execution
+
+**MCP 서버 / Azure SRE Agent로 사용할 때**는 설치가 필요 없습니다 — SRE Agent 포털에서 도구를 호출하면 MCP 서버가 내부적으로 실행합니다.
+
+**단독 실행(Standalone)할 때**:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate     # Windows: .\.venv\Scripts\Activate.ps1
@@ -203,6 +222,12 @@ python windows_diagnose.py --source direct --host WIN-ONPREM01 --winrm-user diag
 | `eventlog` | Error/Critical 이벤트 건수 | ≥ `--log-err-warn`(기본 10건) | ≥ `--log-err-crit`(기본 50건) | 창 내 합계 |
 | `stability` | Kernel-Power(41)/EventLog(6008) | — | 1건 이상 = critical | 예기치 않은 종료/재시작 |
 | `patch` | 보안 업데이트 누락 건수 | 1건 이상 | 10건 이상 | `Update` 테이블(Update Management) |
+| `services` | 자동 시작인데 중지된 서비스 수(direct 전용) | ≥ `--services-warn`(기본 1건) | ≥ `--services-crit`(기본 5건) | `Win32_Service` 필터 결과 건수 |
+| `roles_features` | 설치된 역할/기능(direct 전용, 참고용) | — | — | 항상 info(문제로 간주하지 않음) |
+| `os_lifecycle` | OS EOL 수명주기(direct 전용) | 종료까지 ≤ `--eol-warn-days`(기본 180일) | 이미 종료 | 임베디드 수명주기 표 대조 |
+| `win11_readiness` | Windows 11 하드웨어 요건(Windows 10 대상시만, direct 전용) | TPM/Secure Boot 미충족 | — | TPM 2.0/Secure Boot 확인(참고용) |
+| `software_eol` | 설치된 알려진 EOL 프로그램(direct 전용) | 1건 이상 발견 | — | .NET/SQL Server/Java 등 패턴 매칭 |
+| `recommended_software` | 권장 관리 도구 미설치(direct 전용) | — | — | 항상 info(문제로 간주하지 않음) |
 | `control_plane` | VM 전원 상태 | — | Deallocated/Stopped = critical | ARM instanceView(선택) |
 
 모든 항목은 데이터가 없으면 숨기지 않고 **"미평가"**로 표시됩니다(다른 도구와 동일한 리포트 완결성 철학).
@@ -272,3 +297,9 @@ Managed Identity에 다음 RBAC를 부여하면 됩니다(azure-monitor 모드 �
 - `--source azure-monitor`: `Update` 테이블은 Update Management(또는 Azure Update Manager) 온보딩이 되어 있어야 채워집니다. 미온보딩 시 "미평가"로 표시됩니다.
 - `--source direct`: Windows Update Agent COM 검색은 WSUS/인터넷 연결 상태에 따라 느릴 수 있으며, 실패하면 조용히 "미평가"로 폴백됩니다(진단 자체는 멈춰리지 않음).
 - 원격 명령 실행(Run Command 등)은 사용하지 않습니다 — azure-monitor 모드는 이미 수집된 원격 측정만 읽고, direct 모드도 읽기 전용 CIM/Get-WinEvent 명령만 실행합니다.
+
+---
+
+## 라이선스
+
+이 프로젝트는 [MIT License](LICENSE)를 따릅니다.
